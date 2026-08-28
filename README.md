@@ -38,8 +38,12 @@ kernel driver. This driver exposes the device as standard SocketCAN interfaces
 sudo pacman -S linux-headers can-utils
 
 # Ubuntu / Debian
-sudo apt install linux-headers-$(uname -r) can-utils
+sudo apt install linux-headers-$(uname -r) linux-modules-extra-$(uname -r) can-utils
 ```
+
+> On Ubuntu, `can-dev` lives in `linux-modules-extra`, which is not installed
+> by default on cloud/minimal images — without it `insmod` fails with
+> unknown-symbol errors for `alloc_candev`, `open_candev` and friends.
 
 ---
 
@@ -51,8 +55,17 @@ sudo apt install linux-headers-$(uname -r) can-utils
 git clone https://github.com/youruser/zcan_usb
 cd zcan_usb
 make
+sudo modprobe can_dev
 sudo insmod zcan_usb.ko
 ```
+
+> After a kernel upgrade, a manual (non-DKMS) build needs the headers and
+> modules for the *new* kernel before it will build and load again:
+>
+> ```bash
+> sudo apt install --reinstall linux-headers-$(uname -r) linux-modules-extra-$(uname -r)
+> sudo reboot
+> ```
 
 ### DKMS (survives kernel updates)
 
@@ -192,8 +205,12 @@ The driver was reverse-engineered using:
 Key findings that were non-obvious:
 - The device sends 2-byte polling packets on EP1 IN every ~16ms; these must
   be discarded when waiting for command responses
-- Both channels must be initialized (INIT+BAUD+START) even when only one is
-  used, or RX stops after TX
+- A channel must be sent `INIT_CAN` **twice** — the second time while it is
+  already started, with no `CMD_RESET_CAN` in between — before the device
+  populates the RX arbitration word and DLC. With only one `INIT_CAN` the
+  payload bytes still arrive on the bulk IN endpoint, but every record has
+  `id == 0` and `dlc == 0` and is discarded as a null record, so the
+  interface looks dead
 - TX frames use `0xF1` marker (classic CAN) or `0xF2` (CAN FD), with a
   26-byte payload for classic CAN and an 86-byte payload for CAN FD
 - `transmit_type = 0x00` (auto-retry) is required; `0x01` causes ~50% packet

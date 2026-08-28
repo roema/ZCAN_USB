@@ -17,7 +17,8 @@
  *  - TX payload is 26 bytes for classic CAN, 86 bytes for CANFD, BEEF-wrapped
  *  - RX frames arrive as raw packets on EP2/EP3: 21 bytes (classic CAN) or
  *    76 bytes (CANFD), no BEEF wrapper
- *  - Both channels must be initialized for stable RX after TX
+ *  - A channel must be INIT_CAN'd twice before it reports RX frame
+ *    headers; a single INIT yields records with id == 0 and dlc == 0
  *
  * CAN FD support (added in 0.8.0):
  *  - The 86-byte TX payload layout was reconstructed byte-exact from
@@ -89,7 +90,7 @@
  *  - Given that, netdev->stats.tx_errors/tx_packets accounting below is a
  *    driver-synthesized approximation, NOT a real hardware error count:
  *    while a channel's fault byte reads ZCAN_STATUS_FAULT_VALUE, every
- *    frame handed to that channel's ndo_start_xmit is counted as
+ *    frame whose TX URB completes on that channel is counted as
  *    tx_errors instead of tx_packets (the USB transfer itself still
  *    completes normally - we have no way to know if any individual frame
  *    actually reached the bus). See zcan_status_poll().
@@ -153,8 +154,8 @@
  * ZCAN_CHANNEL_STATUS/ZCAN_CHANNEL_ERR_INFO (regTECounter, regRECounter,
  * bus-off etc.) - exactly the kind of real controller error state this
  * device's netdev stats cannot provide (see zcan_netdev_xmit/zcan_tx_complete:
- * tx_packets is incremented as soon as the USB URB is handed off, with no
- * feedback on whether the frame was ever ACKed on the physical bus).
+ * tx_packets is incremented when the USB URB completes, with no feedback
+ * on whether the frame was ever ACKed on the physical bus).
  *
  * However, the SAME enum's CMD_RESET_CAN = 0x8009 does NOT match the value
  * verified for this actual device via live USB capture (0x8008, see
@@ -263,8 +264,7 @@
 #define TX_FD_TXTYPE_OFFSET	81
 
 /* RX frame layout (raw, 21 bytes, no BEEF wrapper):
- *  [0..1]  = flags / partial timestamp
- *  [2..3]  = CAN_ID << 2, little-endian → CAN_ID = ([3]<<8 | [2]) >> 2
+ *  [0..3]  = arbitration word, little-endian 32-bit (see below)
  *  [4..5]  = 0x00 0x00
  *  [6]     = lower nibble = DLC
  *  [7]     = 0xFF (fixed)
@@ -276,11 +276,33 @@
 #define RX_DATA_OFFSET		8
 
 /*
+ * RX arbitration word at [0..3], little-endian 32-bit. This is the raw CAN
+ * arbitration field as the controller latched it, not a packed CAN ID:
+ *
+ *   bits  0..28 = identifier
+ *   bit      30 = IDE (1 = extended/29-bit frame, 0 = standard/11-bit)
+ *
+ * Because a 29-bit extended identifier is defined by ISO 11898-1 as an
+ * 11-bit *base* ID followed by an 18-bit extension, the 11-bit ID of a
+ * standard frame lands at bits 18..28 - NOT at bits 0..10. That is why the
+ * standard-frame decode needs a >> 18, and why bytes [0..1] (previously
+ * documented here as "flags / partial timestamp") are in fact the low 18
+ * bits of an extended identifier.
+ *
+ * Worked example, standard ID 0x111, from the capture in PROTOCOL.md:
+ *   [0..3] = 00 00 44 04 → 0x04440000 → >> 18 = 0x111 ✓
+ * which is exactly what the previous ([3]<<8 | [2]) >> 2 formula computed,
+ * so standard-frame decoding is unchanged by this.
+ */
+#define RX_ID_IDE_FLAG		BIT(30)	/* extended (29-bit) frame */
+#define RX_ID_SFF_SHIFT		18	/* base ID sits at bits 18..28 */
+
+/*
  * RX frame layout (raw, 76 bytes, no BEEF wrapper), reconstructed from a
  * live usbmon capture (zcan_dump.pcapng) of ZCAN_ReceiveFD() with both
  * channels bridged - 5 round trips each direction, IDs 0..9:
- *  [0..1]  = flags / partial timestamp (same as classic, undecoded)
- *  [2..3]  = CAN_ID << 2, little-endian (same formula as classic)
+ *  [0..3]  = arbitration word, little-endian 32-bit (same as classic, see
+ *            the RX_ID_IDE_FLAG comment above)
  *  [4..5]  = 0x00 0x00
  *  [6]     = lower nibble = CAN FD DLC CODE (0..15, use can_fd_dlc2len()),
  *            upper nibble = 0x3 in every captured sample (vs. 0x0 for
@@ -950,11 +972,31 @@ static DEVICE_ATTR_RO(status_ch1);
  */
 
 /*
+ * Decode the SocketCAN identifier (including CAN_EFF_FLAG) from the 4-byte
+ * arbitration word at the head of an RX record. Shared by the classic and
+ * CAN FD RX paths - both records carry the identical field, see the
+ * RX_ID_IDE_FLAG comment above for the layout and how it was derived.
+ *
+ * The bytes are assembled by hand rather than with get_unaligned_le32() so
+ * that this builds unmodified across the whole supported kernel range (the
+ * header moved from <asm/unaligned.h> to <linux/unaligned.h> in 6.12).
+ */
+static canid_t zcan_rx_decode_id(const u8 *buf)
+{
+	u32 raw = (u32)buf[0] | ((u32)buf[1] << 8) |
+		  ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
+
+	if (raw & RX_ID_IDE_FLAG)
+		return (raw & CAN_EFF_MASK) | CAN_EFF_FLAG;
+
+	return (raw >> RX_ID_SFF_SHIFT) & CAN_SFF_MASK;
+}
+
+/*
  * Parse a received CAN frame from a 21-byte raw RX packet.
  *
  * RX frame format (verified from live USB captures, fw=0x0200 hw=0x0212):
- *  [0..1]  = flags / partial timestamp
- *  [2..3]  = CAN_ID << 2, little-endian
+ *  [0..3]  = arbitration word, little-endian (see RX_ID_IDE_FLAG above)
  *  [4..5]  = 0x00 0x00
  *  [6]     = lower nibble = DLC  (NOT upper nibble)
  *  [7]     = 0xFF (fixed marker)
@@ -969,14 +1011,12 @@ static void zcan_rx_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	struct net_device *netdev = ch->netdev;
 	struct can_frame *cf;
 	struct sk_buff *skb;
-	u32 can_id;
 	u8 dlc;
 
 	if (len < 9)
 		return;
 
-	can_id = (((u32)buf[3] << 8) | buf[2]) >> 2;
-	dlc    = buf[RX_DLC_OFFSET] & 0x0f;
+	dlc = buf[RX_DLC_OFFSET] & 0x0f;
 
 	if (dlc > 8)
 		dlc = 8;
@@ -985,7 +1025,7 @@ static void zcan_rx_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	if (!skb)
 		return;
 
-	cf->can_id  = can_id & CAN_SFF_MASK;
+	cf->can_id  = zcan_rx_decode_id(buf);
 	cf->can_dlc = dlc;
 	if (len >= RX_DATA_OFFSET + (int)dlc)
 		memcpy(cf->data, buf + RX_DATA_OFFSET, dlc);
@@ -1004,13 +1044,11 @@ static void zcan_rx_canfd_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	struct net_device *netdev = ch->netdev;
 	struct canfd_frame *cf;
 	struct sk_buff *skb;
-	u32 can_id;
 	u8 dlc_code, dlen;
 
 	if (len < RX_DATA_OFFSET + 1)
 		return;
 
-	can_id = (((u32)buf[3] << 8) | buf[2]) >> 2;
 	dlc_code = buf[RX_DLC_OFFSET] & 0x0f;
 	dlen = can_fd_dlc2len(dlc_code);
 	if (dlen > CANFD_MAX_DLEN)
@@ -1020,7 +1058,7 @@ static void zcan_rx_canfd_frame(struct zcan_channel *ch, const u8 *buf, int len)
 	if (!skb)
 		return;
 
-	cf->can_id = can_id & CAN_SFF_MASK;
+	cf->can_id = zcan_rx_decode_id(buf);
 	cf->len    = dlen;
 	if (len >= RX_DATA_OFFSET + (int)dlen)
 		memcpy(cf->data, buf + RX_DATA_OFFSET, dlen);
@@ -1105,9 +1143,28 @@ static void zcan_tx_complete(struct urb *urb)
 	struct net_device *netdev = urb->context;
 	struct zcan_channel *ch = netdev_priv(netdev);
 	struct zcan_priv *priv = ch->priv;
+	unsigned int dlen;
 
-	if (urb->status)
+	if (urb->status) {
 		netdev->stats.tx_errors++;
+		can_free_echo_skb(netdev, 0, NULL);
+	} else {
+		/*
+		 * Loop the frame back to SocketCAN and account it. The echo
+		 * is unconditional on a successful URB: ch_fault is a coarse,
+		 * polled approximation (see the file header) and must not be
+		 * allowed to swallow an application's view of its own sends.
+		 * Only the counter it lands in reflects the fault state.
+		 */
+		dlen = can_get_echo_skb(netdev, 0, NULL);
+
+		if (priv->ch_fault[ch->channel_idx]) {
+			netdev->stats.tx_errors++;
+		} else {
+			netdev->stats.tx_packets++;
+			netdev->stats.tx_bytes += dlen;
+		}
+	}
 
 	atomic_set(&priv->tx_active[ch->channel_idx], 0);
 	netif_wake_queue(netdev);
@@ -1140,7 +1197,7 @@ static void zcan_tx_complete(struct urb *urb)
  * SFF case) - extended (29-bit) classic CAN IDs were previously silently
  * truncated to their low 16 bits since [6..7] was never written.
  */
-static int zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
+static void zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
 {
 	u32 can_id = cf->can_id & CAN_ERR_MASK;
 	bool eff = cf->can_id & CAN_EFF_FLAG;
@@ -1157,18 +1214,23 @@ static int zcan_build_can_tx(u8 *tx_data, u8 ch_idx, struct can_frame *cf)
 	tx_data[TX_CAN_ID_OFFSET]       = (can_id >>  8) & 0xff;
 	tx_data[TX_CAN_ID_OFFSET + 1]   =  can_id        & 0xff;
 	tx_data[TX_CAN_DLC_OFFSET] = dlc;
-	memcpy(tx_data + TX_CAN_DATA_OFFSET, cf->data, dlc);
+	/*
+	 * A remote frame carries no data - it requests dlc bytes from the
+	 * remote node. struct can_frame.data is undefined for an RTR skb, so
+	 * copying it here would put uninitialised kernel memory into the USB
+	 * payload; leave the (already zeroed) data field alone instead.
+	 */
+	if (!rtr)
+		memcpy(tx_data + TX_CAN_DATA_OFFSET, cf->data, dlc);
 	tx_data[TX_CAN_CH_OFFSET] = ch_idx;
 	tx_data[TX_CAN_TXTYPE_OFFSET] = 0x00;	/* normal, auto-retry */
-
-	return dlc;
 }
 
 /*
  * Build a CAN FD TX payload (86 bytes). See TX_CANFD_PAYLOAD_LEN comment
  * above for the format and how it was reconstructed.
  */
-static int zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
+static void zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
 {
 	u32 can_id = cf->can_id & CAN_ERR_MASK;
 	bool eff = cf->can_id & CAN_EFF_FLAG;
@@ -1190,8 +1252,6 @@ static int zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
 	tx_data[TX_FD_CH_OFFSET]    = ch_idx;
 	memcpy(tx_data + TX_FD_DATA_OFFSET, cf->data, len);
 	tx_data[TX_FD_TXTYPE_OFFSET] = 0x00;	/* normal, auto-retry */
-
-	return len;
 }
 
 static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
@@ -1202,7 +1262,7 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	int ch_idx = ch->channel_idx;
 	u8 tx_data[TX_CANFD_PAYLOAD_LEN];
 	bool is_fd = can_is_canfd_skb(skb);
-	int dlc, pkt_len, payload_len;
+	int pkt_len, payload_len;
 	unsigned int ep_out;
 
 	if (can_dev_dropped_skb(netdev, skb))
@@ -1214,12 +1274,12 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 	}
 
 	if (is_fd) {
-		dlc = zcan_build_canfd_tx(tx_data, (u8)ch_idx,
-					  (struct canfd_frame *)skb->data);
+		zcan_build_canfd_tx(tx_data, (u8)ch_idx,
+				    (struct canfd_frame *)skb->data);
 		payload_len = TX_CANFD_PAYLOAD_LEN;
 	} else {
-		dlc = zcan_build_can_tx(tx_data, (u8)ch_idx,
-					(struct can_frame *)skb->data);
+		zcan_build_can_tx(tx_data, (u8)ch_idx,
+				  (struct can_frame *)skb->data);
 		payload_len = TX_CAN_PAYLOAD_LEN;
 	}
 
@@ -1232,28 +1292,34 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
 			  priv->tx_bufs[ch_idx], pkt_len,
 			  zcan_tx_complete, netdev);
 
+	/*
+	 * Hand the skb to the CAN echo buffer instead of freeing it. This
+	 * netdev sets IFF_ECHO, which tells the CAN core the driver performs
+	 * the local echo itself - so without this, frames sent from this host
+	 * are never looped back and candump/python-can on the sending
+	 * interface see nothing at all of their own traffic.
+	 *
+	 * This must happen before usb_submit_urb(): the completion handler
+	 * can run the moment the URB is submitted, and it is what delivers
+	 * (or, on failure, drops) the echo skb. The echo buffer holds a
+	 * single entry, which matches the one-TX-in-flight tx_active guard
+	 * above, so slot 0 is always free here.
+	 */
+	can_put_echo_skb(skb, netdev, 0, 0);
+
 	if (usb_submit_urb(priv->tx_urbs[ch_idx], GFP_ATOMIC)) {
+		can_free_echo_skb(netdev, 0, NULL);
 		netdev->stats.tx_errors++;
 		atomic_set(&priv->tx_active[ch_idx], 0);
-		dev_kfree_skb(skb);
 		return NETDEV_TX_OK;
 	}
 
 	/*
-	 * The USB transfer itself always succeeds here regardless of whether
-	 * the frame ever reaches the physical bus - see the "Fault detection
-	 * / recovery" note in the file header. While zcan_status_poll() has
-	 * this channel flagged faulty, count frames as tx_errors instead of
-	 * tx_packets; this is a driver-side approximation, not a real
-	 * per-frame ACK/error result.
+	 * tx_packets/tx_bytes are accounted in zcan_tx_complete() now that
+	 * the skb outlives this function. Note that a completed URB still
+	 * says nothing about whether the frame reached the physical bus -
+	 * see the "Fault detection / recovery" note in the file header.
 	 */
-	if (priv->ch_fault[ch_idx]) {
-		netdev->stats.tx_errors++;
-	} else {
-		netdev->stats.tx_packets++;
-		netdev->stats.tx_bytes += dlc;
-	}
-	dev_kfree_skb(skb);
 	return NETDEV_TX_OK;
 }
 
@@ -1269,10 +1335,15 @@ static netdev_tx_t zcan_netdev_xmit(struct sk_buff *skb,
  * (verified from USB captures):
  *   INIT CH0 → INIT CH1 → BAUD CH0 → START CH0 → BAUD CH1 → START CH1
  *
- * Both channels must be initialized even when only one is used, since
- * without CH1 init, EP3 stays silent and the device stops delivering
- * RX frames after a TX is performed. However, this sibling-channel
- * setup must only happen once: if the sibling is already running
+ * The sibling channel is initialized here as well, matching the vendor
+ * library. Note that this is NOT what makes RX work - that requires the
+ * second INIT_CAN + START_CAN on the channel being opened (see the
+ * comment on it below). Measured on a 1 Mbit bus: opening can0 alone
+ * with the sibling setup present but only one INIT yields 33 usable
+ * frames in 8 s, while a second INIT with no sibling commands at all
+ * yields 878.
+ *
+ * The sibling setup must only happen once: if the sibling is already running
  * (opened independently, e.g. "ip link set can0 up" followed later by
  * "ip link set can1 up"), re-sending INIT/BAUD/START to it here would
  * silently reset its bitrate to the hardcoded default and restart an
@@ -1327,6 +1398,24 @@ static int zcan_netdev_open(struct net_device *netdev)
 	ret = zcan_start_channel(priv, ch->channel_idx);
 	if (ret) {
 		dev_err(&priv->udev->dev, "START_CAN ch%d failed: %d\n",
+			ch->channel_idx, ret);
+		goto out;
+	}
+
+	/* The device only starts filling in the RX arbitration word and DLC
+	 * once a channel has been INIT_CAN'd a second time while already
+	 * running. After a single INIT_CAN/START_CAN the frame payloads do
+	 * arrive on the bulk IN endpoint, but every record carries id == 0
+	 * and dlc == 0, so the null-record check in zcan_rx_complete()
+	 * discards them and the interface looks dead. Repeating INIT_CAN +
+	 * START_CAN here, with no CMD_RESET_CAN in between, is what makes RX
+	 * work; a CMD_RESET_CAN puts the channel back into the state that
+	 * needs two INITs again.
+	 */
+	zcan_init_channel(priv, ch->channel_idx);
+	ret = zcan_start_channel(priv, ch->channel_idx);
+	if (ret) {
+		dev_err(&priv->udev->dev, "START_CAN ch%d (2nd) failed: %d\n",
 			ch->channel_idx, ret);
 		goto out;
 	}

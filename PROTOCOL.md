@@ -315,8 +315,9 @@ without BEEF framing, but a fixed **76-byte** record instead of 21 bytes.
 
 **Frame structure:**
 ```
-[0..1]  = flags / partial timestamp (same as classic CAN, undecoded)
-[2..3]  = CAN_ID << 2, little-endian (same decode formula as classic CAN)
+[0..3]  = arbitration word, little-endian 32-bit (identical to classic
+          CAN - same layout, same decode; see "The arbitration word" under
+          the classic RX frame format below)
 [4..5]  = 0x00 0x00
 [6]     = lower nibble = CAN FD DLC CODE (0..15, translate via the
           standard CAN FD DLC table: 9→12, 10→16, 11→20, 12→24, 13→32,
@@ -335,11 +336,11 @@ without BEEF framing, but a fixed **76-byte** record instead of 21 bytes.
 Always a fixed 76-byte record regardless of actual `len`, mirroring both
 the classic CAN 21-byte RX record and the fixed 86-byte CAN FD TX payload.
 
-**Example** (ID=0x001, len=64, data=00 01 02 ... 3F):
+**Example** (standard ID=0x001, len=64, data=00 01 02 ... 3F):
 ```
-xx xx  04 00  00 00  3F FF  00 01 02 ... 3F  <4-byte timestamp>
-       ↑↑↑↑               ↑↑
-       ID=1 (0x0004>>2)    DLC code=0xF=15 → len=64
+00 00  04 00  00 00  3F FF  00 01 02 ... 3F  <4-byte timestamp>
+↑↑↑↑↑↑↑↑↑↑↑↑               ↑↑
+ID=1 (0x00040000>>18)       DLC code=0xF=15 → len=64
 ```
 
 ### Known limitation: no verified bit-rate-switched (BRS) data phase
@@ -371,8 +372,7 @@ RX frames arrive as **raw 21-byte packets** without BEEF framing.
 
 **Frame structure (verified from live USB captures):**
 ```
-[0..1]  = flags / partial timestamp (little-endian)
-[2..3]  = CAN_ID << 2, little-endian
+[0..3]  = arbitration word, little-endian 32-bit (see below)
 [4..5]  = 0x00 0x00
 [6]     = lower nibble = DLC  (upper nibble = frame flags)
 [7]     = 0xFF  (fixed marker)
@@ -380,20 +380,62 @@ RX frames arrive as **raw 21-byte packets** without BEEF framing.
 [8+dlc..20]  = 0x00 padding
 ```
 
-**Decoding:**
-```c
-u32 can_id = (((u32)frame[3] << 8) | frame[2]) >> 2;
-u8  dlc    = frame[6] & 0x0f;   /* lower nibble */
-u8 *data   = frame + 8;
+### The arbitration word `[0..3]`
+
+Bytes `[0..3]` are a little-endian 32-bit word holding the raw CAN
+arbitration field as the controller latched it — not a packed CAN ID:
+
+```
+bits  0..28 = identifier
+bit      30 = IDE  (1 = extended / 29-bit frame, 0 = standard / 11-bit)
 ```
 
-**Example** (ID=0x111, DLC=4, data=AA BB CC 00):
+ISO 11898-1 defines a 29-bit extended identifier as an 11-bit **base ID**
+followed by an 18-bit **extension**, so the identifier of a *standard*
+frame lands at bits 18..28 — **not** at bits 0..10. Bytes `[0..1]`, which
+earlier revisions of this document described as "flags / partial
+timestamp", are in fact the low 18 bits of an extended identifier (they
+read as zero on standard frames).
+
+**Decoding:**
+```c
+u32 raw = (u32)frame[0] | ((u32)frame[1] << 8) |
+	  ((u32)frame[2] << 16) | ((u32)frame[3] << 24);
+
+if (raw & BIT(30))
+	can_id = (raw & CAN_EFF_MASK) | CAN_EFF_FLAG;	/* 29-bit */
+else
+	can_id = (raw >> 18) & CAN_SFF_MASK;		/* 11-bit  */
+
+u8  dlc  = frame[6] & 0x0f;   /* lower nibble */
+u8 *data = frame + 8;
 ```
-xx xx  44 04  00 00  04 FF  AA BB CC 00  00 00 00 00 00 00 00 00 00 00 00
-       ↑↑↑↑               ↑↑
-       ID=0x111            DLC=4 (lower nibble of 0x04)
+
+The standard-frame branch is arithmetically identical to the older
+`(((u32)frame[3] << 8) | frame[2]) >> 2` formula, so 11-bit decoding is
+unchanged.
+
+**Example** (standard ID=0x111, DLC=4, data=AA BB CC 00):
 ```
-CAN ID calculation: `(0x0444) >> 2 = 0x111` ✓
+00 00  44 04  00 00  04 FF  AA BB CC 00  00 00 00 00 00 00 00 00 00 00 00
+↑↑↑↑↑↑↑↑↑↑↑↑               ↑↑
+arbitration word            DLC=4 (lower nibble of 0x04)
+```
+CAN ID calculation: `0x04440000 >> 18 = 0x111` ✓
+(equivalently `0x0444 >> 2 = 0x111`)
+
+**Example** (extended ID=0x04DA0081, DLC=8):
+```
+81 00  DA 44  00 00  08 FF  <8 data bytes>  00 ... 00
+↑↑↑↑↑↑↑↑↑↑↑↑
+arbitration word = 0x44DA0081
+```
+`0x44DA0081 & BIT(30)` is set → extended frame,
+`0x44DA0081 & CAN_EFF_MASK = 0x04DA0081` ✓
+
+Decoding this frame with the standard-frame formula instead yields
+`0x44DA >> 2 = 0x1136`, masked to 11 bits `0x136` — i.e. the base ID
+alone. This is the truncation reported in issue #1.
 
 ---
 
