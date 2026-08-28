@@ -4,7 +4,7 @@
  *
  * Supports: NXP USB CANFD DEBUG / Zhiyuan Electronics USBCANFD-200U
  * USB ID:   04d8:0053
- * Version:  0.9.0
+ * Version:  0.10.0
  *
  * This driver was completely reverse-engineered from USB traffic captures
  * and static analysis of the vendor library (libcontrolcanfd.a).
@@ -115,7 +115,7 @@
 #include <crypto/skcipher.h>
 #include <linux/scatterlist.h>
 
-#define DRIVER_VERSION	"0.9.0"
+#define DRIVER_VERSION	"0.10.0"
 #define DRIVER_NAME	"zcan_usb"
 
 #define ZCAN_VENDOR_ID		0x04d8
