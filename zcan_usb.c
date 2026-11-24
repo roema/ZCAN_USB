@@ -102,6 +102,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/netdevice.h>
@@ -114,6 +115,13 @@
 #include <linux/workqueue.h>
 #include <crypto/skcipher.h>
 #include <linux/scatterlist.h>
+
+/* Linux 6.16 moved the CAN FD data-phase fields of struct can_priv into .fd. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define ZCAN_FD(can) ((can)->fd)
+#else
+#define ZCAN_FD(can) (*(can))
+#endif
 
 #define DRIVER_VERSION	"0.10.0"
 #define DRIVER_NAME	"zcan_usb"
@@ -1518,10 +1526,10 @@ static int zcan_set_data_bittiming(struct net_device *netdev)
 {
 	struct zcan_channel *ch = netdev_priv(netdev);
 
-	if (ch->can.fd.data_bittiming.bitrate != ch->can.bittiming.bitrate) {
+	if (ZCAN_FD(&ch->can).data_bittiming.bitrate != ch->can.bittiming.bitrate) {
 		netdev_err(netdev,
 			   "dbitrate must equal bitrate (%u != %u) - bit-rate-switched CAN FD is unverified on this device, see zcan_usb.c header\n",
-			   ch->can.fd.data_bittiming.bitrate,
+			   ZCAN_FD(&ch->can).data_bittiming.bitrate,
 			   ch->can.bittiming.bitrate);
 		return -EINVAL;
 	}
@@ -1619,8 +1627,8 @@ static int zcan_probe(struct usb_interface *intf,
 
 		/* CAN FD data phase - see zcan_set_data_bittiming() for the
 		 * same-rate-only limitation. */
-		ch->can.fd.data_bittiming_const  = &zcan_bittiming_const;
-		ch->can.fd.do_set_data_bittiming = zcan_set_data_bittiming;
+		ZCAN_FD(&ch->can).data_bittiming_const  = &zcan_bittiming_const;
+		ZCAN_FD(&ch->can).do_set_data_bittiming = zcan_set_data_bittiming;
 
 		SET_NETDEV_DEV(netdev, &intf->dev);
 		/* can_set_default_mtu() isn't exported on all kernels; set
