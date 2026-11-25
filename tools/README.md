@@ -32,8 +32,7 @@ sudo ip link set can1 type can bitrate 500000
 sudo ip link set can1 up
 ```
 
-For CAN FD (needs zcan_usb >= 0.8.0; the driver currently requires
-`dbitrate == bitrate`, see the driver's known BRS limitation):
+For CAN FD (needs zcan_usb >= 0.8.0):
 
 ```sh
 sudo ip link set can0 type can bitrate 500000 dbitrate 500000 fd on
