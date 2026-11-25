@@ -31,17 +31,14 @@
  *    channel byte all matched exactly).
  *  - INIT_CAN/SET_BAUD do NOT change for CAN FD: the capture shows the
  *    vendor demo initializing FD channels with the exact same acc_code/
- *    acc_mask/dbit_timing/baud_code as classic CAN (type=0x01 was already
- *    required for classic CAN too, see below) - abit_timing was left
- *    uninitialized by the vendor demo itself (differed between channels
- *    with no correlation to the configured rate) and 64-byte CANFD frames
- *    still transmitted/received correctly end-to-end on real hardware, so
- *    it is set to 0 here, matching the classic path.
- *  - CONSEQUENCE / KNOWN LIMITATION: no evidence of a genuine faster data
- *    phase (BRS) was found or tested - the capture only exercises CAN FD
- *    at the *same* bitrate as arbitration. do_set_data_bittiming() below
- *    therefore requires the data bitrate to equal the nominal bitrate.
- *    Real bit-rate-switched operation is unverified.
+ *    acc_mask/abit_timing/baud_code as classic CAN (type=0x01 was already
+ *    required for classic CAN too, see below).
+ *  - Bit-rate switching: ZCAN_InitCAN() in libcontrolcanfd sends the
+ *    ZCAN_SetAbitBaud() code at INIT_CAN [18..21] and the
+ *    ZCAN_SetDbitBaud() code at [22..25], which the capture had as the
+ *    fixed bytes 03 01 0a 02 (the 1 Mbit/s data row). A CAN FD channel
+ *    sends the row of zcan_dbit_table for its dbitrate; a classic channel
+ *    keeps those fixed bytes.
  *  - RX record framing (21 vs 76 bytes) is distinguished by the upper
  *    nibble of byte[6] (0x00 = classic, non-zero = CANFD carrying the DLC
  *    code) - confirmed consistently across all 10 captured RX frames, but
@@ -102,6 +99,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
 #include <linux/netdevice.h>
@@ -114,6 +112,13 @@
 #include <linux/workqueue.h>
 #include <crypto/skcipher.h>
 #include <linux/scatterlist.h>
+
+/* Linux 6.16 moved the CAN FD data-phase fields of struct can_priv into .fd. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define ZCAN_FD(can) ((can)->fd)
+#else
+#define ZCAN_FD(can) (*(can))
+#endif
 
 #define DRIVER_VERSION	"0.10.0"
 #define DRIVER_NAME	"zcan_usb"
@@ -245,7 +250,9 @@
  *  [5]     = RTR flag (0 = data, 1 = remote)
  *  [6..9]  = CAN ID, big-endian 32-bit, masked to 29 bits
  *  [10]    = len - actual byte count 0..64 (canfd_frame.len, NOT a DLC code)
- *  [11]    = flags - raw canfd_frame.flags (CANFD_BRS/CANFD_ESI)
+ *  [11]    = flags - CANFD_BRS only: the device also switches the bit
+ *            rate of a frame with CANFD_FDF set, as Linux sets it on
+ *            every CAN FD frame
  *  [12]    = 0x01  fixed (always 1, unconditional in the vendor packer)
  *  [13]    = channel index (0 or 1) - NOTE: different offset than classic!
  *  [14..14+len-1] = data
@@ -307,7 +314,8 @@
  *  [6]     = lower nibble = CAN FD DLC CODE (0..15, use can_fd_dlc2len()),
  *            upper nibble = 0x3 in every captured sample (vs. 0x0 for
  *            classic) - used as the RX demux discriminator, see the
- *            "KNOWN LIMITATION" note in the file header.
+ *            file header. The vendor library reads bit 5 as FD and
+ *            bit 4 as BRS (RX_FD_BRS_FLAG).
  *  [7]     = 0xFF (fixed, same as classic)
  *  [8..8+len-1] = CAN data (len from the DLC code, up to 64)
  *  [72..75]     = running ~100us hardware timestamp counter, little-endian
@@ -316,6 +324,7 @@
  * classic 21-byte record and the fixed-size 86-byte TX payload).
  */
 #define RX_FD_FRAME_SIZE	76
+#define RX_FD_BRS_FLAG		0x10
 
 /* Driver limits */
 #define ZCAN_MAX_PKG_SIZE	512
@@ -670,12 +679,12 @@ static int zcan_get_info(struct zcan_priv *priv)
  * Baud rate table
  * -------------------------------------------------------------------------
  * Values reverse-engineered from USB captures of ZCAN_SetAbitBaud + InitCAN.
- * dbit_timing: used in INIT_CAN payload bytes [18..21]
+ * abit_timing: used in INIT_CAN payload bytes [18..21]
  * baud_code:   used in SET_BAUD payload bytes [2..3]
  */
 static const struct {
 	u32 bitrate;
-	u32 dbit_timing;
+	u32 abit_timing;
 	u16 baud_code;
 } zcan_baud_table[] = {
 	{ 1000000, 0x00022e0b, 0x007f },
@@ -684,13 +693,71 @@ static const struct {
 	{  125000, 0x0114be2f, 0x3fff },
 };
 
-static u32 zcan_dbit_timing(u32 bitrate)
+static u32 zcan_abit_timing(u32 bitrate)
 {
 	int i;
 	for (i = 0; i < ARRAY_SIZE(zcan_baud_table); i++)
 		if (zcan_baud_table[i].bitrate == bitrate)
-			return zcan_baud_table[i].dbit_timing;
+			return zcan_baud_table[i].abit_timing;
 	return 0x00025e17; /* default 500k */
+}
+
+/*
+ * Data-phase timing for INIT_CAN payload bytes [22..25], copied from the
+ * ZCAN_SetDbitBaud() table in libcontrolcanfd. Both this and abit_timing
+ * pack, high byte first, brp-1, (probably) sjw-1, prop+phase1-1, phase2-1
+ * of a 60 MHz clock, not the 80 MHz reported in can.clock: the timing the
+ * kernel computes is not sent, only the bitrate selects a row.
+ */
+#define ZCAN_DBIT_DEFAULT	0x03010a02	/* the 1 Mbit/s row */
+
+static const struct {
+	u32 bitrate;
+	u32 dbit_timing;
+} zcan_dbit_table[] = {
+	{ 5000000, 0x00010702 },
+	{ 4000000, 0x00010a02 },
+	{ 3000000, 0x01000601 },
+	{ 2500000, 0x01010702 },
+	{ 2400000, 0x00011204 },
+	{ 2000000, 0x01010a02 },
+	{ 1500000, 0x03000601 },
+	{ 1250000, 0x03010702 },
+	{ 1200000, 0x01011204 },
+	{ 1000000, 0x03010a02 },
+	{  800000, 0x04010a02 },
+	{  600000, 0x09000601 },
+	{  500000, 0x05020e03 },
+	{  400000, 0x09010a02 },
+	{  300000, 0x13000601 },
+	{  250000, 0x0b020e03 },
+	{  200000, 0x13010a02 },
+	{  125000, 0x17020e03 },
+	{  100000, 0x1d020e03 },
+};
+
+static u32 zcan_dbit_lookup(u32 dbitrate)
+{
+	int i;
+	for (i = 0; i < ARRAY_SIZE(zcan_dbit_table); i++)
+		if (zcan_dbit_table[i].bitrate == dbitrate)
+			return zcan_dbit_table[i].dbit_timing;
+	return 0;
+}
+
+/*
+ * The row for the dbitrate, also when it equals the nominal bitrate: a frame
+ * sent with CANFD_BRS runs its data phase at this rate. A classic channel
+ * sends ZCAN_DBIT_DEFAULT, the value the driver has always sent.
+ */
+static u32 zcan_dbit_timing(const struct zcan_channel *zch)
+{
+	u32 dbit;
+
+	if (!(zch->can.ctrlmode & CAN_CTRLMODE_FD))
+		return ZCAN_DBIT_DEFAULT;
+	dbit = zcan_dbit_lookup(ZCAN_FD(&zch->can).data_bittiming.bitrate);
+	return dbit ?: ZCAN_DBIT_DEFAULT;
 }
 
 static u16 zcan_baud_code(u32 bitrate)
@@ -713,9 +780,10 @@ static u16 zcan_baud_code(u32 bitrate)
  *  [4..5]  = 0x00 0x00
  *  [6..9]  = acc_code = 0x00000001
  *  [10..13]= acc_mask = 0xFFFFFFFF
- *  [14..17]= abit_timing = 0x00000000
- *  [18..21]= dbit_timing (bitrate-dependent, see zcan_baud_table)
- *  [22..25]= 0x03 0x01 0x0A 0x02  (fixed, from capture)
+ *  [14..17]= 0x00000000 (the vendor sends its struct's reserved field;
+ *            [14] = 0x80 marks a ZCAN_SetBaudRateCustom() timing)
+ *  [18..21]= abit_timing, nominal (bitrate-dependent, see zcan_baud_table)
+ *  [22..25]= dbit_timing, data phase (see zcan_dbit_timing())
  *  [26..29]= 0x00000000
  *  [30]    = 0x00  (termination disabled - hardware always has 120Ω)
  *  [31]    = 0x00
@@ -724,16 +792,17 @@ static int zcan_init_channel(struct zcan_priv *priv, int ch)
 {
 	struct zcan_channel *zch = netdev_priv(priv->netdevs[ch]);
 	u32 bitrate = zch->can.bittiming.bitrate ?: 500000;
-	u32 dbit    = zcan_dbit_timing(bitrate);
+	u32 abit    = zcan_abit_timing(bitrate);
+	u32 dbit    = zcan_dbit_timing(zch);
 	u8 data[32] = {
 		0x55, 0x02,
 		(u8)ch, 0x01,		/* channel, type (must be 0x01) */
 		0x00, 0x00,
 		0x00, 0x00, 0x00, 0x01,	/* acc_code */
 		0xff, 0xff, 0xff, 0xff,	/* acc_mask */
-		0x00, 0x00, 0x00, 0x00,	/* abit_timing */
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,	/* abit_timing (filled below) */
 		0x00, 0x00, 0x00, 0x00,	/* dbit_timing (filled below) */
-		0x03, 0x01, 0x0a, 0x02,	/* fixed (from capture) */
 		0x00, 0x00, 0x00, 0x00,
 		0x00, 0x00		/* termination off */
 	};
@@ -742,10 +811,14 @@ static int zcan_init_channel(struct zcan_priv *priv, int ch)
 
 	int ret;
 
-	data[18] = (dbit >> 24) & 0xff;
-	data[19] = (dbit >> 16) & 0xff;
-	data[20] = (dbit >>  8) & 0xff;
-	data[21] =  dbit        & 0xff;
+	data[18] = (abit >> 24) & 0xff;
+	data[19] = (abit >> 16) & 0xff;
+	data[20] = (abit >>  8) & 0xff;
+	data[21] =  abit        & 0xff;
+	data[22] = (dbit >> 24) & 0xff;
+	data[23] = (dbit >> 16) & 0xff;
+	data[24] = (dbit >>  8) & 0xff;
+	data[25] =  dbit        & 0xff;
 
 	ret = zcan_cmd(priv, CMD_INIT_CAN, data, sizeof(data),
 			resp, &resp_len);
@@ -1060,6 +1133,8 @@ static void zcan_rx_canfd_frame(struct zcan_channel *ch, const u8 *buf, int len)
 
 	cf->can_id = zcan_rx_decode_id(buf);
 	cf->len    = dlen;
+	if (buf[RX_DLC_OFFSET] & RX_FD_BRS_FLAG)
+		cf->flags |= CANFD_BRS;
 	if (len >= RX_DATA_OFFSET + (int)dlen)
 		memcpy(cf->data, buf + RX_DATA_OFFSET, dlen);
 
@@ -1247,7 +1322,7 @@ static void zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
 	tx_data[TX_FD_ID_OFFSET + 2] = (can_id >>  8) & 0xff;
 	tx_data[TX_FD_ID_OFFSET + 3] =  can_id        & 0xff;
 	tx_data[TX_FD_LEN_OFFSET]   = len;
-	tx_data[TX_FD_FLAGS_OFFSET] = cf->flags;
+	tx_data[TX_FD_FLAGS_OFFSET] = cf->flags & CANFD_BRS;
 	tx_data[TX_FD_FIXED_OFFSET] = 0x01;	/* fixed, unconditional in vendor packer */
 	tx_data[TX_FD_CH_OFFSET]    = ch_idx;
 	memcpy(tx_data + TX_FD_DATA_OFFSET, cf->data, len);
@@ -1506,23 +1581,18 @@ static int zcan_set_bittiming(struct net_device *netdev)
 /*
  * do_set_data_bittiming callback (CAN FD data phase).
  *
- * KNOWN LIMITATION: the live capture used to reverse-engineer CAN FD
- * support only exercised the data phase at the SAME bitrate as arbitration
- * (see the "CAN FD support" note in the file header) - no register
- * encoding for a genuinely faster data phase (BRS) has been verified.
- * Reject anything else here rather than silently ignoring it, so a wrong
- * dbitrate fails loudly ('ip link set ... fd on') instead of quietly
- * transmitting at the wrong rate.
+ * The data phase is sent in INIT_CAN when the channel opens; here a dbitrate
+ * outside zcan_dbit_table is rejected, so it fails at 'ip link set' instead
+ * of transmitting at another rate.
  */
 static int zcan_set_data_bittiming(struct net_device *netdev)
 {
 	struct zcan_channel *ch = netdev_priv(netdev);
+	u32 dbitrate = ZCAN_FD(&ch->can).data_bittiming.bitrate;
 
-	if (ch->can.fd.data_bittiming.bitrate != ch->can.bittiming.bitrate) {
-		netdev_err(netdev,
-			   "dbitrate must equal bitrate (%u != %u) - bit-rate-switched CAN FD is unverified on this device, see zcan_usb.c header\n",
-			   ch->can.fd.data_bittiming.bitrate,
-			   ch->can.bittiming.bitrate);
+	if (!zcan_dbit_lookup(dbitrate)) {
+		netdev_err(netdev, "dbitrate %u not supported by the device\n",
+			   dbitrate);
 		return -EINVAL;
 	}
 	return 0;
@@ -1617,10 +1687,9 @@ static int zcan_probe(struct usb_interface *intf,
 		ch->can.do_set_bittiming   = zcan_set_bittiming;
 		ch->can.ctrlmode_supported = CAN_CTRLMODE_LOOPBACK | CAN_CTRLMODE_FD;
 
-		/* CAN FD data phase - see zcan_set_data_bittiming() for the
-		 * same-rate-only limitation. */
-		ch->can.fd.data_bittiming_const  = &zcan_bittiming_const;
-		ch->can.fd.do_set_data_bittiming = zcan_set_data_bittiming;
+		/* CAN FD data phase - see zcan_set_data_bittiming() */
+		ZCAN_FD(&ch->can).data_bittiming_const  = &zcan_bittiming_const;
+		ZCAN_FD(&ch->can).do_set_data_bittiming = zcan_set_data_bittiming;
 
 		SET_NETDEV_DEV(netdev, &intf->dev);
 		/* can_set_default_mtu() isn't exported on all kernels; set

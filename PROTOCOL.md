@@ -153,17 +153,18 @@ response = AES_128_ECB_encrypt(key, challenge[0:16])
 [4..5]  = 0x00 0x00
 [6..9]  = acc_code = 0x00000001
 [10..13]= acc_mask = 0xFFFFFFFF
-[14..17]= abit_timing = 0x00000000
-[18..21]= dbit_timing (bitrate-dependent, see table below)
-[22..25]= 0x03 0x01 0x0A 0x02  (fixed, from capture)
+[14..17]= 0x00000000 (the vendor library sends its config struct's
+          reserved field; [14] = 0x80 marks a ZCAN_SetBaudRateCustom() timing)
+[18..21]= abit_timing, nominal phase (see table below)
+[22..25]= dbit_timing, data phase (see "Data phase timing" under CAN FD)
 [26..29]= 0x00000000
 [30]    = 0x00  (termination disabled — hardware has fixed 120Ω)
 [31]    = 0x00
 ```
 
-**dbit_timing values:**
+**abit_timing values:**
 
-| Bitrate     | dbit_timing  |
+| Bitrate     | abit_timing  |
 |-------------|--------------|
 | 125 kbit/s  | `0x0114BE2F` |
 | 250 kbit/s  | `0x0014BE2F` |
@@ -286,7 +287,9 @@ classic CAN.
 [6..9]  = CAN ID, big-endian 32-bit, masked to 29 bits
 [10]    = len - actual data byte count 0..64 (NOT a DLC code, unlike the
           RX side - this is the same value as struct canfd_frame.len)
-[11]    = flags - raw canfd_frame.flags (CANFD_BRS / CANFD_ESI bits)
+[11]    = flags - CANFD_BRS (0x01) only. The device also switches the
+          bit rate of a frame with CANFD_FDF (0x04) set, and Linux sets
+          that on every CAN FD frame
 [12]    = 0x01  fixed (always 1 in the vendor packer, unconditional)
 [13]    = channel index (0 or 1) - NOTE: different offset than classic
           CAN, which uses byte[20]
@@ -343,18 +346,31 @@ the classic CAN 21-byte RX record and the fixed 86-byte CAN FD TX payload.
 ID=1 (0x00040000>>18)       DLC code=0xF=15 → len=64
 ```
 
-### Known limitation: no verified bit-rate-switched (BRS) data phase
+### Data phase timing (bit-rate switching)
 
-INIT_CAN/SET_BAUD are sent identically for CAN FD and classic CAN channels
-(same acc_code/acc_mask/dbit_timing/baud_code, `type=0x01` was already
-required for classic CAN too - see CMD_INIT_CAN above). The capture used
-to reverse-engineer this only exercised CAN FD at the *same* bitrate for
-arbitration and data phase; the vendor demo itself left `abit_timing`
-uninitialized (it differed between the two channels in the capture with no
-correlation to the configured rate), yet 64-byte CAN FD frames still
-transmitted and received correctly end-to-end. No register encoding for a
-genuinely faster, bit-rate-switched data phase has been found or tested.
-The driver requires `dbitrate == bitrate` and rejects anything else.
+`ZCAN_InitCAN()` in `libcontrolcanfd` builds INIT_CAN from two per-channel
+codes: the one `ZCAN_SetAbitBaud()` selected goes to `[18..21]`, the one
+`ZCAN_SetDbitBaud()` selected to `[22..25]`. Both come from fixed tables in
+the library. This was read from the library's disassembly. No capture has
+shown a data rate other than 1 Mbit/s. Each code packs, high byte first,
+`brp-1`, (probably) `sjw-1`, `prop+phase1-1` and `phase2-1`. Every row of
+both tables decodes exactly to its bitrate with a 60 MHz clock, so the
+device's clock is 60 MHz, not the 80 MHz the driver reports.
+
+| Data bitrate | dbit_timing  | tq         | sample point |
+|--------------|--------------|------------|--------------|
+| 5 Mbit/s     | `0x00010702` | 12         | 75%          |
+| 4 Mbit/s     | `0x00010A02` | 15         | 80%          |
+| 2 Mbit/s     | `0x01010A02` | 15 (brp 2) | 80%          |
+| 1 Mbit/s     | `0x03010A02` | 15 (brp 4) | 80%          |
+
+`zcan_dbit_table` in `zcan_usb.c` holds the full table. The fixed bytes
+`03 01 0A 02` that earlier captures showed at `[22..25]` are the 1 Mbit/s
+row. A classic channel still sends them. A CAN FD channel sends the row
+of its dbitrate, also when that equals the nominal bitrate.
+
+In an RX record, `[6]` bit 5 marks CAN FD and bit 4 marks BRS. This is how
+the vendor library decodes it.
 
 ---
 
