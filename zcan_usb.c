@@ -253,7 +253,9 @@
  *  [5]     = RTR flag (0 = data, 1 = remote)
  *  [6..9]  = CAN ID, big-endian 32-bit, masked to 29 bits
  *  [10]    = len - actual byte count 0..64 (canfd_frame.len, NOT a DLC code)
- *  [11]    = flags - raw canfd_frame.flags (CANFD_BRS/CANFD_ESI)
+ *  [11]    = flags - CANFD_BRS only: the device also switches the bit
+ *            rate of a frame with CANFD_FDF set, as Linux sets it on
+ *            every CAN FD frame
  *  [12]    = 0x01  fixed (always 1, unconditional in the vendor packer)
  *  [13]    = channel index (0 or 1) - NOTE: different offset than classic!
  *  [14..14+len-1] = data
@@ -1255,7 +1257,7 @@ static void zcan_build_canfd_tx(u8 *tx_data, u8 ch_idx, struct canfd_frame *cf)
 	tx_data[TX_FD_ID_OFFSET + 2] = (can_id >>  8) & 0xff;
 	tx_data[TX_FD_ID_OFFSET + 3] =  can_id        & 0xff;
 	tx_data[TX_FD_LEN_OFFSET]   = len;
-	tx_data[TX_FD_FLAGS_OFFSET] = cf->flags;
+	tx_data[TX_FD_FLAGS_OFFSET] = cf->flags & CANFD_BRS;
 	tx_data[TX_FD_FIXED_OFFSET] = 0x01;	/* fixed, unconditional in vendor packer */
 	tx_data[TX_FD_CH_OFFSET]    = ch_idx;
 	memcpy(tx_data + TX_FD_DATA_OFFSET, cf->data, len);

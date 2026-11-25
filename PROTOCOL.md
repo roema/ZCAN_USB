@@ -286,7 +286,9 @@ classic CAN.
 [6..9]  = CAN ID, big-endian 32-bit, masked to 29 bits
 [10]    = len - actual data byte count 0..64 (NOT a DLC code, unlike the
           RX side - this is the same value as struct canfd_frame.len)
-[11]    = flags - raw canfd_frame.flags (CANFD_BRS / CANFD_ESI bits)
+[11]    = flags - CANFD_BRS (0x01) only. The device also switches the
+          bit rate of a frame with CANFD_FDF (0x04) set, and Linux sets
+          that on every CAN FD frame
 [12]    = 0x01  fixed (always 1 in the vendor packer, unconditional)
 [13]    = channel index (0 or 1) - NOTE: different offset than classic
           CAN, which uses byte[20]
